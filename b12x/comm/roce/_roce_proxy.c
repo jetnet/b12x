@@ -533,6 +533,11 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
 // flag and the CQ drain stay serviced.  B12X_ROCE_WFE=0 restores the spin;
 // other CPUs keep the spin unchanged.
 #if defined(__aarch64__)
+// After this many parks without a doorbell the proxy naps between polls instead,
+// exactly as the unpatched loop does, so a long idle stretch leaves the core to
+// the kernel's idle states: 8192 nominal 1 ms park budgets, about 8.2 s total,
+// excluding loop work and scheduling delays.
+#define ROCE_WFE_IDLE_PARKS 8192
 static inline uint64_t roce_cntvct(void) {
     uint64_t t;
     __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(t)::"memory");
@@ -588,12 +593,12 @@ static void *proxy_main(void *arg) {
     // A parked iteration lasts until the next store to the line, an event-stream
     // event (~131 us on GB10) or the 1 ms WFET deadline; a spin iteration ~1 us.
     // Drain the CQs every 8 parked iterations instead of every 64 spins.
-    const uint64_t drain_every = use_wfe ? 8 : 64;
+    const uint64_t drain_mask = use_wfe ? 7 : 63;
     while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
         uint32_t seq = __atomic_load_n(&ctrl[0], __ATOMIC_ACQUIRE);
         if (seq == c->last_seq) {
             idle++;
-            if (idle % drain_every == 0) {
+            if ((idle & drain_mask) == 0) {
                 for (int h = 0; h < c->n_hca; h++) {
                     if (drain_cq(c, h) != 0) {
                         atomic_store(&c->failed, 1);
@@ -603,7 +608,11 @@ static void *proxy_main(void *arg) {
             }
 #if defined(__aarch64__)
             if (use_wfe) {
-                roce_wait_change(&ctrl[0], seq, roce_cntvct() + wfe_slice);
+                if (idle > ROCE_WFE_IDLE_PARKS) {
+                    nanosleep(&nap, NULL);  // a long idle stretch naps, as the unpatched loop does
+                } else {
+                    roce_wait_change(&ctrl[0], seq, roce_cntvct() + wfe_slice);
+                }
                 continue;
             }
 #endif
